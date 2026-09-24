@@ -4,8 +4,14 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from .greenwave import compute_windows
-from .schemas import GreenWaveRequest, Window
+from .greenwave import compute_offset_diagnostics, compute_windows
+from .schemas import (
+    GreenWaveRequest,
+    OffsetDiagnosticsRequest,
+    OffsetDiagnosticsResponse,
+    OffsetInterval,
+    Window,
+)
 
 app = FastAPI(
     title="干线绿波发车窗口 API",
@@ -49,3 +55,33 @@ def green_wave_windows(request: GreenWaveRequest) -> list[Window]:
         depart_to=request.depart_to,
     )
     return [Window(start=start, end=end) for start, end in windows]
+
+
+@app.post(
+    "/api/green-wave/offset-diagnostics",
+    response_model=OffsetDiagnosticsResponse,
+    tags=["绿波"],
+    summary="单路口偏移诊断：最少错配数与全部最优 offset 区间",
+)
+def offset_diagnostics(
+    request: OffsetDiagnosticsRequest,
+) -> OffsetDiagnosticsResponse:
+    request.validate_ranges()
+    minimum, intervals = compute_offset_diagnostics(
+        cycle=request.cycle,
+        green_start=request.green_start,
+        green_end=request.green_end,
+        observations=[
+            {
+                "arrival_time": obs.arrival_time,
+                "observed_green": obs.observed_green,
+            }
+            for obs in request.observations
+        ],
+    )
+    return OffsetDiagnosticsResponse(
+        minimum_mismatches=minimum,
+        optimal_offsets=[
+            OffsetInterval(start=start, end=end) for start, end in intervals
+        ],
+    )

@@ -5,7 +5,13 @@ from __future__ import annotations
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-from .greenwave import MAX_CYCLE, MAX_INTERSECTIONS, MAX_WINDOW_SECONDS
+from .greenwave import (
+    MAX_CYCLE,
+    MAX_INTERSECTIONS,
+    MAX_OBSERVATIONS,
+    MIN_OBSERVATIONS,
+    MAX_WINDOW_SECONDS,
+)
 
 
 class Intersection(BaseModel):
@@ -116,3 +122,72 @@ class Window(BaseModel):
 
 
 GreenWaveResponse = list[Window]
+
+
+# ---------------------------------------------------------------------------
+# 偏移诊断
+# ---------------------------------------------------------------------------
+
+
+class OffsetObservation(BaseModel):
+    """一条车辆到达观测，全部为整数秒。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    arrival_time: int = Field(
+        ..., ge=0, le=MAX_CYCLE,
+        description="车辆到达路口的绝对时刻（整数秒，>= 0，仅其对 cycle 取模的相位参与计算）",
+    )
+    observed_green: bool = Field(
+        ..., description="该时刻实际观测到的灯色：true 为绿，false 为红"
+    )
+
+
+class OffsetDiagnosticsRequest(BaseModel):
+    """单路口偏移诊断请求。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    cycle: int = Field(
+        ..., ge=1, le=MAX_CYCLE, description="信号周期 C（秒），1..86400"
+    )
+    green_start: int = Field(
+        ..., ge=0, description="绿灯起点（本地相位秒），需满足 0 <= green_start < cycle"
+    )
+    green_end: int = Field(
+        ..., ge=0,
+        description="绿灯终点（本地相位秒，不含），需满足 0 <= green_end < cycle；与起点相等时为整周期常绿",
+    )
+    observations: list[OffsetObservation] = Field(
+        ..., min_length=MIN_OBSERVATIONS, max_length=MAX_OBSERVATIONS,
+        description=f"到达观测列表，{MIN_OBSERVATIONS}..{MAX_OBSERVATIONS} 条",
+    )
+
+    def validate_ranges(self) -> None:
+        """校验绿灯端点落在 [0, cycle) 内；不合法时抛出 HTTP 422。"""
+        errors: list[str] = []
+        if not 0 <= self.green_start < self.cycle:
+            errors.append("green_start 必须满足 0 <= green_start < cycle")
+        if not 0 <= self.green_end < self.cycle:
+            errors.append("green_end 必须满足 0 <= green_end < cycle")
+        if errors:
+            raise HTTPException(status_code=422, detail=errors)
+
+
+class OffsetInterval(BaseModel):
+    """一段最优整数 offset 的极大半开区间 [start, end)，端点均满足 0 <= start < end <= cycle。"""
+
+    start: int = Field(..., ge=0, description="区间起点（整数 offset，含）")
+    end: int = Field(..., ge=1, description="区间终点（整数 offset，不含）；跨零点的极大区间在 [0,cycle) 内分段表示")
+
+
+class OffsetDiagnosticsResponse(BaseModel):
+    """偏移诊断结果。"""
+
+    minimum_mismatches: int = Field(
+        ..., ge=0,
+        description="全部整数 offset ∈ [0, cycle) 中最少的错配观测条数",
+    )
+    optimal_offsets: list[OffsetInterval] = Field(
+        ..., description="取得最少错配数的全部极大半开 offset 区间，按起点升序"
+    )

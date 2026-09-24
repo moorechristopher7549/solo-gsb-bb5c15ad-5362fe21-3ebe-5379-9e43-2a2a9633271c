@@ -1,12 +1,16 @@
 # 干线绿波发车窗口 API
 
-基于 **Python 3.11 + FastAPI** 的干线（arterial）绿波发车窗口计算服务。
+基于 **Python 3.11 + FastAPI** 的干线（arterial）绿波信号计算服务，提供两个接口：
 
-给定干线上至多 8 个路口各自的信号周期、相位偏移、周期内绿灯半开区间（允许跨周期零点）
+1. **绿波发车窗口**：给定干线上至多 8 个路口各自的信号周期、相位偏移、周期内绿灯半开区间（允许跨周期零点）
 以及从起点到该路口的行驶秒数（可选上限 `travel_max`，表示实际行驶时间可取闭区间
 `[travel, travel_max]` 内任意实数秒），并给定一个不超过 3600 秒（一小时）的整数秒
 **半开**发车范围，服务返回在该范围内出发、**对任意可能的行驶时间**抵达**每个**路口时
 都恰好遇到绿灯的**全部极大半开发车区间**，按起点升序排列；不存在任何可行窗口时返回空数组 `[]`。
+2. **单路口偏移诊断**（`POST /api/green-wave/offset-diagnostics`）：给定单个路口的周期、
+绿灯相位端点与 1～2000 条 `{arrival_time, observed_green}` 实测到达观测，对每个整数
+`offset ∈ [0, cycle)` 按 `(arrival_time + offset) mod cycle` 预测灯色，返回**最少错配
+条数**以及取得该最小值的**全部极大半开 offset 区间**（按起点排序）。
 
 ## 目录结构
 
@@ -14,10 +18,10 @@
 .
 ├── app/
 │   ├── __init__.py
-│   ├── greenwave.py      # 纯算法：周期展开 + 区间求交，无逐秒试探
+│   ├── greenwave.py      # 纯算法：窗口区间求交 + 偏移诊断事件扫描，无逐秒/逐 offset 试探
 │   ├── schemas.py        # Pydantic 请求/响应模型与输入校验
 │   └── main.py           # FastAPI 入口与路由
-├── tests/                # pytest 测试（含 400 组随机用例的逐秒对照）
+├── tests/                # pytest 测试（含随机用例的暴力对照）
 ├── conftest.py
 ├── requirements.txt
 ├── Dockerfile
@@ -66,6 +70,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- |
 | 健康检查 | `GET http://localhost:8000/health` |
 | 绿波窗口计算 | `POST http://localhost:8000/api/green-wave/windows` |
+| 单路口偏移诊断 | `POST http://localhost:8000/api/green-wave/offset-diagnostics` |
 | 交互式文档（Swagger UI） | `http://localhost:8000/docs` |
 | OpenAPI 描述 | `http://localhost:8000/openapi.json` |
 
@@ -244,6 +249,135 @@ curl -s -X POST http://localhost:8000/api/green-wave/windows \
 任何出发时刻都无法保证遇绿，该路口（进而整个请求）返回 `[]`；整周期常绿
 （`green_start == green_end`）不受波动影响。省略 `travel_max` 时语义与旧版完全一致。
 
+## 偏移诊断接口：`POST /api/green-wave/offset-diagnostics`
+
+给定**单个路口**的周期与绿灯相位端点，以及 1～2000 条车辆到达观测，反推使预测与观测
+**错配条数最少**的整数相位偏移 `offset`。对每个整数 `offset ∈ [0, cycle)`，到达时刻
+`arrival_time`（整数秒，仅其对周期取模的相位参与计算）的预测灯色由本地相位
+
+```
+(arrival_time + offset) mod cycle
+```
+
+是否落入绿灯集合决定，灯色语义与绿波窗口接口完全一致：
+
+- `green_start < green_end`：绿灯 `[green_start, green_end)`；
+- `green_start > green_end`：跨零点绿灯 `[green_start, cycle) ∪ [0, green_end)`；
+- `green_start == green_end`：整周期常绿 `[0, cycle)`。
+
+预测灯色与 `observed_green` 不一致即记 1 条错配。接口返回：
+
+- `minimum_mismatches`：全部整数 offset 中的最少错配条数；
+- `optimal_offsets`：取得该最小值的**全部极大半开 offset 区间**
+  `[{start, end}, ...]`，端点满足 `0 <= start < end <= cycle`，按起点升序。
+
+**跨零点的最优集合在 `[0, cycle)` 内分段表示**：若同一条极大弧跨过周期零点，
+会输出两段（一段从 0 开始、一段以 cycle 结束），例如 `[0,10)` 与 `[50,60)`。
+整周期常绿且观测全绿等情形下，唯一的最优区间为 `[0, cycle)`。
+
+### 请求体
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `cycle` | int | `1..86400`，信号周期（秒） |
+| `green_start` | int | `0 <= green_start < cycle`，绿灯起点（含） |
+| `green_end` | int | `0 <= green_end < cycle`，绿灯终点（不含）；与起点相等为整周期常绿 |
+| `observations` | array | **1..2000** 条观测 |
+| `observations[].arrival_time` | int | 整数秒，`>= 0`，仅取其对 `cycle` 的模 |
+| `observations[].observed_green` | bool | 实测灯色：`true` 绿 / `false` 红 |
+
+响应：
+
+```json
+{
+  "minimum_mismatches": 0,
+  "optimal_offsets": [{ "start": 20, "end": 40 }]
+}
+```
+
+### 诊断示例 1：普通绿灯
+
+周期 60、绿灯 `[20,40)`，车辆在第 0 秒实测遇绿。offset=20 时该车辆本地相位恰为 20
+（绿灯起点，含），offset=39 时相位 39（仍绿），offset=40 时相位落在右端点（红，半开
+区间不含右端点），故零错配区间恰为 `[20,40)`：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/offset-diagnostics \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cycle": 60,
+    "green_start": 20,
+    "green_end": 40,
+    "observations": [{"arrival_time": 0, "observed_green": true}]
+  }'
+```
+
+```json
+{"minimum_mismatches": 0, "optimal_offsets": [{"start": 20, "end": 40}]}
+```
+
+### 诊断示例 2：跨零点最优集合分段
+
+周期 60、绿灯 `[50,60) ∪ [0,10)`，车辆第 0 秒遇绿：offset ∈ `[50,60) ∪ [0,10)`
+均零错配。该极大弧跨零点，在 `[0,60)` 内以两段返回并按起点排序：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/offset-diagnostics \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cycle": 60,
+    "green_start": 50,
+    "green_end": 10,
+    "observations": [{"arrival_time": 0, "observed_green": true}]
+  }'
+```
+
+```json
+{"minimum_mismatches": 0,
+ "optimal_offsets": [{"start": 0, "end": 10}, {"start": 50, "end": 60}]}
+```
+
+### 诊断示例 3：多观测存在错配
+
+两条绿观测分别在第 0、15 秒到达（绿灯仍为 `[20,40)`），其各自的零错配弧
+`[20,40)` 与 `[5,30)` 的交集 `[20,25)` 可同时满足：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/offset-diagnostics \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cycle": 60,
+    "green_start": 20,
+    "green_end": 40,
+    "observations": [
+      {"arrival_time": 0, "observed_green": true},
+      {"arrival_time": 15, "observed_green": true}
+    ]
+  }'
+```
+
+```json
+{"minimum_mismatches": 0, "optimal_offsets": [{"start": 20, "end": 25}]}
+```
+
+当不存在零错配解时，`minimum_mismatches` 为正整数，`optimal_offsets`
+给出所有"错得最少"的 offset 极大区间（可能有多段、可能跨零点分段）。
+
+### 偏移诊断算法（周期区间事件扫描）
+
+不会对 `offset × 观测` 逐一判定（那将是 `O(cycle × n)`，周期可达 86400）。每条观测
+在 offset 圆（模 cycle 的环）上对应**一条**"预测与观测一致"的半开弧：
+
+- 绿观测的一致弧即预测绿弧，弧长 = 绿灯长度，起点
+  `(green_start - arrival_time) mod cycle`；
+- 红观测的一致弧是它的补集（预测红弧），同样是一条半开弧，起点为预测绿弧的终点。
+
+每条弧只在其两个端点产生差分事件（跨零点的弧拆成 `[lo, cycle)` 与 `[0, hi)` 两段，
+至多四个事件）。全部观测以"观测总数为初始错配数、弧内 −1"的方式叠加差分；事件排序后
+**一次线性扫描**即得到圆上每个常值分段的错配条数，取最小值所在的分段即为全部极大半开
+区间，最后合并端点相接的等值日（整圆弧会被事件点切开）。复杂度 `O(n log n)`，与周期
+长度无关；2000 条观测、周期 86400 的情形也只需毫秒级。
+
 ## 输入校验与错误
 
 无效周期、相位偏移、绿灯端点、行驶时间（含 `travel_max < travel` 或
@@ -253,6 +387,10 @@ curl -s -X POST http://localhost:8000/api/green-wave/windows \
 ```json
 { "detail": ["travel_max 不得小于 travel（路口 中山路）"] }
 ```
+
+偏移诊断接口同样在以下情形返回 422：周期非法（非 1..86400 的整数）、
+`green_start` / `green_end` 不满足 `0 <= 端点 < cycle`，或观测数量不在 1～2000 条
+范围内；`arrival_time` 必须为非负整数、`observed_green` 必须为布尔值。
 
 字段类型错误、缺失字段也由 Pydantic 统一返回 422。
 
@@ -282,4 +420,6 @@ pytest -q
 ```
 
 测试包含边界场景（跨零点、偏移、范围边界、半开端点不含、无空解、行驶时间波动
-`travel_max`）以及 400 组随机参数下与逐秒判定参考实现的逐项对照。
+`travel_max`）以及 400 组随机参数下与逐秒判定参考实现的逐项对照；偏移诊断测试
+覆盖普通/跨零点/常绿相位、多观测并列最优与跨零点分段，并含 600 组随机参数（含
+2000 条观测满规模用例）下与逐 offset 暴力实现的逐项对照。

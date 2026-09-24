@@ -38,6 +38,9 @@ from typing import Iterable
 MAX_CYCLE = 86_400
 MAX_WINDOW_SECONDS = 3_600
 MAX_INTERSECTIONS = 8
+# 偏移诊断接口接受的观测条数上下限。
+MIN_OBSERVATIONS = 1
+MAX_OBSERVATIONS = 2_000
 
 Interval = list[int]  # 长度为 2 的半开区间 [start, end)
 
@@ -208,3 +211,108 @@ def compute_windows(
             return []
     # 求交不会产生相接区间，最后再合并一次以策安全。
     return merge_intervals(common or [])
+
+
+# ---------------------------------------------------------------------------
+# 偏移诊断：给定单路口观测，求错配最少的整数 offset 及对应的极大区间
+# ---------------------------------------------------------------------------
+
+
+def _add_arc_delta(
+    lo: int, hi: int, delta: int, events: dict[int, int], cycle: int
+) -> None:
+    """在 offset 圆上的半开弧 ``[lo, hi)`` 施加差分 ``delta``。
+
+    约定 ``lo ∈ [0, C)``、``hi = lo + 弧长 ∈ [lo, lo + C]``：
+
+    * ``hi == lo``：空弧，不加任何事件；
+    * ``hi <= C``：普通弧 ``[lo, hi)``（``hi == C`` 时为 ``[lo, C)``）；
+    * ``hi > C``：跨零点，拆成 ``[lo, C) ∪ [0, hi - C)``。
+    """
+    if hi == lo:
+        return
+    if hi <= cycle:
+        events[lo] = events.get(lo, 0) + delta
+        events[hi] = events.get(hi, 0) - delta
+    else:
+        events[lo] = events.get(lo, 0) + delta
+        events[cycle] = events.get(cycle, 0) - delta
+        events[0] = events.get(0, 0) + delta
+        events[hi - cycle] = events.get(hi - cycle, 0) - delta
+
+
+def compute_offset_diagnostics(
+    cycle: int,
+    green_start: int,
+    green_end: int,
+    observations: Iterable[dict],
+) -> tuple[int, list[Interval]]:
+    """求使观测错配条数最少的整数 offset 集合（offset ∈ [0, C)）。
+
+    预测灯色沿用绿灯半开区间语义：本地相位
+    ``(arrival_time + offset) mod C`` 落入绿灯半开区间集合即预测为绿，
+    ``green_start == green_end`` 时整周期常绿。
+
+    每条观测在 offset 圆上划出一条"与观测灯色一致"的半开弧：
+
+    * 观测为绿（一致 ⇔ 预测绿）：弧长等于绿灯长度，起点
+      ``(green_start - arrival_time) mod C``；
+    * 观测为红（一致 ⇔ 预测红）：取补集，弧长 ``C - 绿灯长度``。
+
+    每条观测只在不属于其一致弧的 offset 上贡献 1 次错配。所有弧以
+    **两个差分事件**（跨零点至多四个）叠加，事件总数 O(观测数)；
+    排序后一次扫描即得到每个 offset 分段上的错配条数，复杂度
+    ``O(n log n)``，与周期长度无关。扫描结果天然把圆切成常值段，
+    取最小值所在的段即为全部极大半开区间；跨零点的极大弧在
+    ``[0, C)`` 内以两段表示，按起点排序。
+
+    返回 ``(最少错配条数, 区间列表)``。
+    """
+    # 绿灯长度（整周期常绿时为 C），以及圆上的绿灯半开弧起点。
+    if green_start == green_end:
+        green_length = cycle
+    elif green_start < green_end:
+        green_length = green_end - green_start
+    else:
+        green_length = cycle - green_start + green_end
+
+    events: dict[int, int] = {}
+    n_observations = 0
+    for obs in observations:
+        n_observations += 1
+        arrival_phase = obs["arrival_time"] % cycle
+        if obs["observed_green"]:
+            # 预测绿弧：相位 x ∈ 绿灯集，offset ≡ x - arrival (mod C)。
+            lo = (green_start - arrival_phase) % cycle
+            length = green_length
+        else:
+            # 一致弧为预测红，即预测绿弧在圆上的补集：同样是一条半开弧，
+            # 起点恰为预测绿弧的终点。
+            lo = (green_start - arrival_phase + green_length) % cycle
+            length = cycle - green_length
+        # hi 可能 > C，_add_arc_delta 负责把跨零点弧拆成 [lo,C) ∪ [0,hi-C)。
+        _add_arc_delta(lo, lo + length, -1, events, cycle)
+
+    # 扫描：每条观测在其一致弧上抵消 1 次错配，故圆上初始错配数为观测总数；
+    # events[0] 的差分须先施加，它作用于从 0 开始的那段。positions 含 0 与 C。
+    positions = sorted(events)
+    if 0 not in positions:
+        positions.insert(0, 0)
+    if cycle not in positions:
+        positions.append(cycle)
+
+    segments: list[tuple[int, Interval]] = []
+    mismatches = n_observations + events.get(0, 0)
+    prev = 0
+    for pos in positions[1:]:
+        if pos > prev:
+            segments.append((mismatches, [prev, pos]))
+        mismatches += events.get(pos, 0)
+        prev = pos
+
+    minimum = min(count for count, _ in segments)
+    optimal = [interval for count, interval in segments if count == minimum]
+    # 整圆弧（常绿观测、红观测一致弧为空等）仍会在事件点产生相接的等值日，
+    # 合并端点相接（[a,b) 与 [b,c)）的段，恢复真正的极大区间。注意跨零点
+    # 拆分出的首段 [0,b) 与末段 [a,C) 不相接，不会被合并，保留为两段表示。
+    return minimum, merge_intervals(optimal)

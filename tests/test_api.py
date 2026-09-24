@@ -1,9 +1,10 @@
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from app.main import green_wave_windows
-from app.schemas import GreenWaveRequest, Intersection
+from app.main import app, green_wave_windows, offset_diagnostics
+from app.schemas import GreenWaveRequest, Intersection, OffsetDiagnosticsRequest
 
 
 def make_request(payload):
@@ -195,3 +196,176 @@ def test_travel_max_86400_boundary_accepted():
     req.validate_ranges()
     windows = green_wave_windows(req)
     assert [[w.start, w.end] for w in windows] == [[0, 60]]
+
+
+# ---------- 偏移诊断接口 ----------
+
+def make_diag_request(payload):
+    return OffsetDiagnosticsRequest.model_validate(payload)
+
+
+def test_offset_diagnostics_plain_case():
+    req = make_diag_request(
+        {
+            "cycle": 60,
+            "green_start": 20,
+            "green_end": 40,
+            "observations": [
+                {"arrival_time": 0, "observed_green": True},
+                {"arrival_time": 15, "observed_green": True},
+            ],
+        }
+    )
+    result = offset_diagnostics(req)
+    assert result.minimum_mismatches == 0
+    assert [[i.start, i.end] for i in result.optimal_offsets] == [[20, 25]]
+
+
+def test_offset_diagnostics_wrapping_optimal_set():
+    # 跨零点最优集合在 [0,cycle) 内分段表示
+    req = make_diag_request(
+        {
+            "cycle": 60,
+            "green_start": 50,
+            "green_end": 10,
+            "observations": [{"arrival_time": 0, "observed_green": True}],
+        }
+    )
+    result = offset_diagnostics(req)
+    assert result.minimum_mismatches == 0
+    assert [[i.start, i.end] for i in result.optimal_offsets] == [
+        [0, 10], [50, 60]
+    ]
+
+
+def test_offset_diagnostics_always_green_full_cycle():
+    req = make_diag_request(
+        {
+            "cycle": 60,
+            "green_start": 10,
+            "green_end": 10,
+            "observations": [{"arrival_time": 3, "observed_green": True}],
+        }
+    )
+    result = offset_diagnostics(req)
+    assert result.minimum_mismatches == 0
+    assert [[i.start, i.end] for i in result.optimal_offsets] == [[0, 60]]
+
+
+def test_offset_diagnostics_reject_green_endpoint_outside_cycle():
+    req = make_diag_request(
+        {
+            "cycle": 60,
+            "green_start": 0,
+            "green_end": 60,
+            "observations": [{"arrival_time": 0, "observed_green": True}],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        req.validate_ranges()
+    assert exc.value.status_code == 422
+
+
+def test_offset_diagnostics_reject_invalid_cycle():
+    with pytest.raises(ValidationError):
+        make_diag_request(
+            {
+                "cycle": 0,
+                "green_start": 0,
+                "green_end": 0,
+                "observations": [{"arrival_time": 0, "observed_green": True}],
+            }
+        )
+
+
+def test_offset_diagnostics_reject_empty_observations():
+    with pytest.raises(ValidationError):
+        make_diag_request(
+            {"cycle": 60, "green_start": 0, "green_end": 10, "observations": []}
+        )
+
+
+def test_offset_diagnostics_reject_too_many_observations():
+    with pytest.raises(ValidationError):
+        make_diag_request(
+            {
+                "cycle": 60,
+                "green_start": 0,
+                "green_end": 10,
+                "observations": [
+                    {"arrival_time": i, "observed_green": True}
+                    for i in range(2001)
+                ],
+            }
+        )
+
+
+def test_offset_diagnostics_accepts_exactly_2000_observations():
+    req = make_diag_request(
+        {
+            "cycle": 60,
+            "green_start": 0,
+            "green_end": 0,
+            "observations": [
+                {"arrival_time": i, "observed_green": True}
+                for i in range(2000)
+            ],
+        }
+    )
+    req.validate_ranges()
+    result = offset_diagnostics(req)
+    assert result.minimum_mismatches == 0
+    assert [[i.start, i.end] for i in result.optimal_offsets] == [[0, 60]]
+
+
+def test_offset_diagnostics_http_endpoint():
+    client = TestClient(app)
+    response = client.post(
+        "/api/green-wave/offset-diagnostics",
+        json={
+            "cycle": 60,
+            "green_start": 20,
+            "green_end": 40,
+            "observations": [{"arrival_time": 0, "observed_green": True}],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "minimum_mismatches": 0,
+        "optimal_offsets": [{"start": 20, "end": 40}],
+    }
+
+
+def test_offset_diagnostics_http_422_payload():
+    client = TestClient(app)
+    response = client.post(
+        "/api/green-wave/offset-diagnostics",
+        json={
+            "cycle": 60,
+            "green_start": 0,
+            "green_end": 60,
+            "observations": [{"arrival_time": 0, "observed_green": True}],
+        },
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert any("green_end" in item for item in detail)
+
+
+def test_offset_diagnostics_http_422_missing_field():
+    client = TestClient(app)
+    response = client.post(
+        "/api/green-wave/offset-diagnostics",
+        json={"cycle": 60, "green_start": 0, "green_end": 10},
+    )
+    assert response.status_code == 422
+
+
+def test_offset_diagnostics_route_in_openapi():
+    client = TestClient(app)
+    schema = client.get("/openapi.json").json()
+    assert "/api/green-wave/offset-diagnostics" in schema["paths"]
+    operation = schema["paths"]["/api/green-wave/offset-diagnostics"]["post"]
+    assert operation["summary"]
+    assert "OffsetDiagnosticsRequest" in schema["components"]["schemas"]
+    assert "OffsetDiagnosticsResponse" in schema["components"]["schemas"]
