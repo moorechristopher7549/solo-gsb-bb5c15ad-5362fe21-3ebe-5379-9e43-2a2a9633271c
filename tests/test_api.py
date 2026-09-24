@@ -2,8 +2,8 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-from app.main import green_wave_windows
-from app.schemas import GreenWaveRequest, Intersection
+from app.main import green_wave_offset_diagnostics, green_wave_windows
+from app.schemas import GreenWaveRequest, Intersection, OffsetDiagnosticsRequest
 
 
 def make_request(payload):
@@ -195,3 +195,171 @@ def test_travel_max_86400_boundary_accepted():
     req.validate_ranges()
     windows = green_wave_windows(req)
     assert [[w.start, w.end] for w in windows] == [[0, 60]]
+
+
+# ---------- POST /api/green-wave/offset-diagnostics ----------
+
+def make_diag_request(payload):
+    return OffsetDiagnosticsRequest.model_validate(payload)
+
+
+def test_offset_diagnostics_payload_plain_green():
+    req = make_diag_request(
+        {
+            "cycle": 60,
+            "green_start": 20,
+            "green_end": 40,
+            "observations": [
+                {"arrival_time": 0, "observed_green": True},
+                {"arrival_time": 5, "observed_green": True},
+            ],
+        }
+    )
+    resp = green_wave_offset_diagnostics(req)
+    # arrival=0 观测绿 ⇔ offset∈[20,40)；arrival=5 观测绿 ⇔ offset∈[15,35)
+    # 零错配集合为两者之交 [20,35)
+    assert resp.min_mismatches == 0
+    assert [[w.start, w.end] for w in resp.optimal_intervals] == [[20, 35]]
+
+
+def test_offset_diagnostics_payload_wrapping_optimal_set():
+    req = make_diag_request(
+        {
+            "cycle": 60,
+            "green_start": 50,
+            "green_end": 10,
+            "observations": [{"arrival_time": 0, "observed_green": True}],
+        }
+    )
+    resp = green_wave_offset_diagnostics(req)
+    assert resp.min_mismatches == 0
+    assert [[w.start, w.end] for w in resp.optimal_intervals] == [
+        [0, 10], [50, 60]
+    ]
+
+
+def test_offset_diagnostics_min_mismatches_positive():
+    # 常绿路口但观测到红灯：任何 offset 都错 1 条
+    req = make_diag_request(
+        {
+            "cycle": 60,
+            "green_start": 30,
+            "green_end": 30,
+            "observations": [{"arrival_time": 9, "observed_green": False}],
+        }
+    )
+    resp = green_wave_offset_diagnostics(req)
+    assert resp.min_mismatches == 1
+    assert [[w.start, w.end] for w in resp.optimal_intervals] == [[0, 60]]
+
+
+def test_offset_diagnostics_accepts_negative_arrival_time():
+    req = make_diag_request(
+        {
+            "cycle": 60,
+            "green_start": 20,
+            "green_end": 40,
+            "observations": [{"arrival_time": -1, "observed_green": True}],
+        }
+    )
+    resp = green_wave_offset_diagnostics(req)
+    assert resp.min_mismatches == 0
+    assert [[w.start, w.end] for w in resp.optimal_intervals] == [[21, 41]]
+
+
+def test_offset_diagnostics_rejects_zero_cycle():
+    with pytest.raises(ValidationError):
+        make_diag_request(
+            {
+                "cycle": 0,
+                "green_start": 0,
+                "green_end": 10,
+                "observations": [{"arrival_time": 0, "observed_green": True}],
+            }
+        )
+
+
+def test_offset_diagnostics_rejects_cycle_over_86400():
+    with pytest.raises(ValidationError):
+        make_diag_request(
+            {
+                "cycle": 86401,
+                "green_start": 0,
+                "green_end": 10,
+                "observations": [{"arrival_time": 0, "observed_green": True}],
+            }
+        )
+
+
+def test_offset_diagnostics_rejects_green_start_outside_cycle():
+    req = make_diag_request(
+        {
+            "cycle": 60,
+            "green_start": 60,
+            "green_end": 10,
+            "observations": [{"arrival_time": 0, "observed_green": True}],
+        }
+    )
+    with pytest.raises(HTTPException) as exc:
+        req.validate_ranges()
+    assert exc.value.status_code == 422
+
+
+def test_offset_diagnostics_rejects_negative_green_end():
+    with pytest.raises(ValidationError):
+        make_diag_request(
+            {
+                "cycle": 60,
+                "green_start": 0,
+                "green_end": -1,
+                "observations": [{"arrival_time": 0, "observed_green": True}],
+            }
+        )
+
+
+def test_offset_diagnostics_rejects_empty_observations():
+    with pytest.raises(ValidationError):
+        make_diag_request(
+            {"cycle": 60, "green_start": 0, "green_end": 10, "observations": []}
+        )
+
+
+def test_offset_diagnostics_rejects_too_many_observations():
+    with pytest.raises(ValidationError):
+        make_diag_request(
+            {
+                "cycle": 60,
+                "green_start": 0,
+                "green_end": 10,
+                "observations": [
+                    {"arrival_time": i, "observed_green": True}
+                    for i in range(2001)
+                ],
+            }
+        )
+
+
+def test_offset_diagnostics_accepts_2000_observations_boundary():
+    req = make_diag_request(
+        {
+            "cycle": 60,
+            "green_start": 0,
+            "green_end": 0,  # 常绿
+            "observations": [
+                {"arrival_time": i, "observed_green": True}
+                for i in range(2000)
+            ],
+        }
+    )
+    req.validate_ranges()
+    resp = green_wave_offset_diagnostics(req)
+    assert resp.min_mismatches == 0
+    assert [[w.start, w.end] for w in resp.optimal_intervals] == [[0, 60]]
+
+
+def test_offset_diagnostics_route_is_in_openapi():
+    from app.main import app
+
+    paths = app.openapi()["paths"]
+    assert "/api/green-wave/offset-diagnostics" in paths
+    assert "post" in paths["/api/green-wave/offset-diagnostics"]

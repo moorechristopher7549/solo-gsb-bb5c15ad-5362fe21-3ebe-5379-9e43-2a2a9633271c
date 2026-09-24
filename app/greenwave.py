@@ -38,6 +38,7 @@ from typing import Iterable
 MAX_CYCLE = 86_400
 MAX_WINDOW_SECONDS = 3_600
 MAX_INTERSECTIONS = 8
+MAX_OBSERVATIONS = 2_000
 
 Interval = list[int]  # 长度为 2 的半开区间 [start, end)
 
@@ -208,3 +209,142 @@ def compute_windows(
             return []
     # 求交不会产生相接区间，最后再合并一次以策安全。
     return merge_intervals(common or [])
+
+
+# ---------- 单路口 offset 诊断 ----------
+
+Observation = tuple[int, bool]  # (arrival_time, observed_green)
+
+
+def _shifted_circle_intervals(
+    cycle: int,
+    green_start: int,
+    green_end: int,
+    shift: int,
+) -> list[Interval]:
+    """周期圆上的绿灯集合平移 -shift 后、落在 [0, C) 内的半开整数区间。
+
+    即满足 ``(p + shift) mod C`` 落在绿灯集合中的 p 集合
+    （本地绿灯 ``[a,b)`` 平移后为 ``[a-shift, b-shift) mod C``）。
+    ``green_start == green_end``（整周期常绿）时返回 ``[[0, C]]``；
+    跨零点的平移结果可能在 [0, C) 内断成两段。
+    """
+    if green_start == green_end:
+        return [[0, cycle]]
+    shift %= cycle
+    intervals: list[Interval] = []
+    # 非跨零点绿灯 [gs, ge) 是一段；跨零点先视为连续段 [gs, C+ge)。
+    raw = (
+        [(green_start, green_end)]
+        if green_start < green_end
+        else [(green_start, cycle + green_end)]
+    )
+    for a, b in raw:
+        lo = (a - shift) % cycle
+        hi = (b - shift) % cycle
+        length = b - a  # 非常绿段长度必小于 C，平移后至多绕零点一次
+        if lo < hi:
+            intervals.append([lo, hi])
+        else:
+            # 半开长度不变：从 lo 起 length 秒，跨零点则断成两段。
+            intervals.append([lo, min(cycle, lo + length)])
+            tail = (lo + length) % cycle
+            if tail:
+                intervals.append([0, tail])
+    return merge_intervals(intervals)
+
+
+def _complement_in_cycle(intervals: list[Interval], cycle: int) -> list[Interval]:
+    """[0, C) 内一组有序互不相交半开区间的补集（同为半开区间）。"""
+    result: list[Interval] = []
+    cursor = 0
+    for start, end in intervals:
+        if cursor < start:
+            result.append([cursor, start])
+        cursor = end
+    if cursor < cycle:
+        result.append([cursor, cycle])
+    return result
+
+
+def _mismatch_intervals_for_observation(
+    cycle: int,
+    green_start: int,
+    green_end: int,
+    arrival_time: int,
+    observed_green: bool,
+) -> list[Interval]:
+    """单条观测的"预测灯色 != 观测灯色" offset 集合（[0,C) 内半开区间）。
+
+    offset 预测灯色为绿，当且仅当 ``(arrival_time + offset) mod C``
+    落在绿灯集合中；观测为绿时错配集合为其补集（预测为红），观测为红时
+    错配集合即预测为绿的集合。
+    """
+    green_offsets = _shifted_circle_intervals(
+        cycle, green_start, green_end, arrival_time % cycle
+    )
+    if not observed_green:
+        return green_offsets
+    return _complement_in_cycle(green_offsets, cycle)
+
+
+def offset_diagnostics(
+    cycle: int,
+    green_start: int,
+    green_end: int,
+    observations: Iterable[Observation],
+) -> tuple[int, list[Interval]]:
+    """求最少错配条数及取到最小值的全部极大半开 offset 区间。
+
+    对整数 ``offset ∈ [0, C)``，按 ``(arrival_time + offset) mod C``
+    预测灯色（绿灯半开区间、跨零点、端点相等为常绿的语义与其余接口一致），
+    统计预测与 ``observed_green`` 不符的观测条数。返回
+    ``(最少错配条数, 最优 offset 区间列表)``，区间按起点升序。
+
+    采用周期区间事件扫描：每条观测的错配集合至多两条半开区间，仅在区间
+    端点放置 +1/-1 差分事件，按事件位置排序后逐段维护当前错配数，全程不
+    枚举 offset × 观测（复杂度 O(n log n)，与 cycle 大小无关）。跨零点的
+    最优集合天然在 [0, C) 内分段表示；同错配数的相邻段合并为极大区间。
+    """
+    # 事件：(位置, 增量)。错配数只在整数区间端点处变化，段内恒定。
+    events: list[tuple[int, int]] = []
+    for arrival_time, observed_green in observations:
+        for start, end in _mismatch_intervals_for_observation(
+            cycle, green_start, green_end, arrival_time, observed_green
+        ):
+            events.append((start, 1))
+            events.append((end, -1))
+
+    if not events:
+        # 无任何错配事件 ⇔ 所有观测均与整周期常绿一致：每个 offset 都最优。
+        return 0, [[0, cycle]]
+
+    events.sort()
+    segments: list[tuple[int, int, int]] = []  # (起点, 终点, 错配数)
+    mismatches = 0
+    prev = 0
+    i = 0
+    while i < len(events):
+        pos = events[i][0]
+        if prev < pos:
+            segments.append((prev, pos, mismatches))
+        delta = 0
+        while i < len(events) and events[i][0] == pos:
+            delta += events[i][1]
+            i += 1
+        mismatches += delta
+        prev = pos
+    if prev < cycle:
+        segments.append((prev, cycle, mismatches))
+
+    minimum = min(seg[2] for seg in segments)
+    # 合并相邻且同为最小错配数的段，得到全部极大半开区间。
+    optimal: list[Interval] = []
+    for start, end, value in segments:
+        if value != minimum:
+            continue
+        if optimal and optimal[-1][1] == start:
+            optimal[-1][1] = end
+        else:
+            optimal.append([start, end])
+    return minimum, optimal

@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-from .greenwave import MAX_CYCLE, MAX_INTERSECTIONS, MAX_WINDOW_SECONDS
+from .greenwave import MAX_CYCLE, MAX_INTERSECTIONS, MAX_OBSERVATIONS, MAX_WINDOW_SECONDS
 
 
 class Intersection(BaseModel):
@@ -116,3 +116,69 @@ class Window(BaseModel):
 
 
 GreenWaveResponse = list[Window]
+
+
+class OffsetObservation(BaseModel):
+    """一条车辆到达观测：整数秒绝对到达时刻与当时是否绿灯。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    arrival_time: int = Field(
+        ..., description="车辆到达时刻 t（整数秒，可为任意整数，按周期取模）"
+    )
+    observed_green: bool = Field(
+        ..., description="到达时刻该路口实际灯色：true=绿，false=红"
+    )
+
+
+class OffsetDiagnosticsRequest(BaseModel):
+    """单路口 offset 诊断请求。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    cycle: int = Field(
+        ..., ge=1, le=MAX_CYCLE, description="信号周期 C（秒），1..86400"
+    )
+    green_start: int = Field(
+        ..., ge=0, description="绿灯起点（本地相位秒），需满足 0 <= green_start < C"
+    )
+    green_end: int = Field(
+        ..., ge=0, description="绿灯终点（本地相位秒，不含），需满足 0 <= green_end < C"
+    )
+    observations: list[OffsetObservation] = Field(
+        ..., min_length=1, max_length=MAX_OBSERVATIONS,
+        description="到达观测列表，1..2000 条",
+    )
+
+    def validate_ranges(self) -> None:
+        """跨字段校验：绿灯相位端点必须在一个周期内；非法时抛 HTTP 422。"""
+        errors: list[str] = []
+        if not 0 <= self.green_start < self.cycle:
+            errors.append("green_start 必须满足 0 <= green_start < cycle")
+        if not 0 <= self.green_end < self.cycle:
+            errors.append("green_end 必须满足 0 <= green_end < cycle")
+        if errors:
+            raise HTTPException(status_code=422, detail=errors)
+
+
+class OffsetInterval(BaseModel):
+    """一个取到最少错配数的极大半开 offset 区间 [start, end)。"""
+
+    start: int = Field(..., ge=0, description="offset 区间起点（秒，含）")
+    end: int = Field(..., ge=1, description="offset 区间终点（秒，不含）")
+
+
+class OffsetDiagnosticsResponse(BaseModel):
+    """offset 诊断结果：最少错配条数及取到该值的全部极大半开 offset 区间。"""
+
+    min_mismatches: int = Field(
+        ..., ge=0, description="所有整数 offset∈[0,cycle) 中最少的预测错配观测条数"
+    )
+    optimal_intervals: list[OffsetInterval] = Field(
+        ...,
+        description=(
+            "取到最少错配数的全部极大半开 offset 区间 [start,end)，"
+            "整数 offset 满足 start <= offset < end；按起点升序；"
+            "跨零点的最优集合在 [0,cycle) 内分段表示"
+        ),
+    )
